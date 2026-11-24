@@ -258,8 +258,14 @@ final class MiddleControlHub {
 
     private func stop() {
         stopped = true
-        conn?.cancel(); conn = nil
-        setConnected(false)
+        // Close a moment later, so stops sent just before (a camera being removed) go out
+        // first. A camera added again in that moment keeps the connection.
+        queue.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            guard let self, self.stopped, self.listeners.isEmpty else { return }
+            self.conn?.cancel(); self.conn = nil
+            self.rx = ""
+            self.setConnected(false)
+        }
     }
 
     private func setConnected(_ on: Bool) {
