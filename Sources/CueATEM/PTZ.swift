@@ -8,15 +8,18 @@ import Combine
 // - VISCA over IP (UDP 52381): Sony, BirdDog, newer PTZOptics, Panasonic in VISCA mode,
 //   Canon when its VISCA setting is on.
 // - VISCA over TCP (5678): PTZOptics and most budget cameras.
+// - Middle Control (TCP 11580): cameras on DJI gimbals with a MiddleThings APC-R, driven
+//   through the Middle Control app (see MiddleControl.swift).
 
 public enum VISCAProtocol: String, Codable, CaseIterable, Identifiable {
-    case canonXC, sonyUDP, rawTCP
+    case canonXC, sonyUDP, rawTCP, middleControl
     public var id: String { rawValue }
     public var label: String {
         switch self {
         case .canonXC: return "Canon (HTTP)"
         case .sonyUDP: return "VISCA over IP (UDP)"
         case .rawTCP: return "VISCA over TCP"
+        case .middleControl: return "Middle Control (gimbal)"
         }
     }
     public var defaultPort: UInt16 {
@@ -24,10 +27,13 @@ public enum VISCAProtocol: String, Codable, CaseIterable, Identifiable {
         case .canonXC: return 80
         case .sonyUDP: return 52381
         case .rawTCP: return 5678
+        case .middleControl: return 11580
         }
     }
     /// Canon's HTTP protocol can't save presets without an admin login.
     public var canStorePresets: Bool { self != .canonXC }
+    /// Reports where it points, so stage scan, saved shots and auto tracking can use it.
+    public var reportsPosition: Bool { self == .canonXC || self == .middleControl }
 }
 
 public struct PTZCamera: Codable, Identifiable, Hashable {
@@ -47,9 +53,13 @@ public struct PTZCamera: Codable, Identifiable, Hashable {
     /// The order the camera's own presets are shown in, by preset number. Ones not listed
     /// come after, by number.
     public var presetOrder: [Int] = []
+    /// Middle Control only: the camera's number in Middle Control (1, 2, 3...).
+    public var mcCamera: Int?
+    /// Middle Control only: how the gimbal turns and what the lens sees.
+    public var gimbal: GimbalSetup?
     public init() {}
 
-    private enum Keys: String, CodingKey { case id, name, host, port, proto, atemInput, firstPreset, presetNames, shots, presetOrder }
+    private enum Keys: String, CodingKey { case id, name, host, port, proto, atemInput, firstPreset, presetNames, shots, presetOrder, mcCamera, gimbal }
 
     /// Lenient, so a camera can be written by hand (or by Claude) in the config file:
     /// only `host` is needed, everything else has a sensible default. The port follows
@@ -66,6 +76,8 @@ public struct PTZCamera: Codable, Identifiable, Hashable {
         presetNames = try c.decodeIfPresent([Int: String].self, forKey: .presetNames) ?? [:]
         shots = try c.decodeIfPresent([PTZShot].self, forKey: .shots) ?? []
         presetOrder = try c.decodeIfPresent([Int].self, forKey: .presetOrder) ?? []
+        mcCamera = try c.decodeIfPresent(Int.self, forKey: .mcCamera)
+        gimbal = try c.decodeIfPresent(GimbalSetup.self, forKey: .gimbal)
     }
 }
 
@@ -217,10 +229,14 @@ protocol PTZLink: AnyObject {
     func setExposure(_ e: PTZExposure)
     /// Hand gain, shutter and iris back to the camera, where it has one mode for that.
     func autoExposure()
+    /// Move to a position over a set time, smoothly (slow creative moves). Cameras that
+    /// can't time a move just go there.
+    func glide(to p: PTZPosition, seconds: Double)
 }
 
 extension PTZLink {
     func readShotPosition(_ done: @escaping (PTZPosition?) -> Void) { readPosition(done) }
+    func glide(to p: PTZPosition, seconds: Double) { goTo(p) }
 }
 
 // MARK: - VISCA
@@ -984,7 +1000,8 @@ public final class PTZController: ObservableObject {
 
     /// Only reconnect when an address or protocol changed, not when a name did.
     private func links(differ old: [PTZCamera]) -> Bool {
-        old.map { "\($0.id)\($0.host)\($0.port)\($0.proto)\($0.firstPreset)" } != cameras.map { "\($0.id)\($0.host)\($0.port)\($0.proto)\($0.firstPreset)" }
+        old.map { "\($0.id)\($0.host)\($0.port)\($0.proto)\($0.firstPreset)\($0.mcCamera ?? 0)\($0.gimbal.map { "\($0)" } ?? "")" }
+            != cameras.map { "\($0.id)\($0.host)\($0.port)\($0.proto)\($0.firstPreset)\($0.mcCamera ?? 0)\($0.gimbal.map { "\($0)" } ?? "")" }
     }
 
     private func restart() {
@@ -993,7 +1010,12 @@ public final class PTZController: ObservableObject {
             for l in self.links.values { l.stop() }
             self.links = [:]
             for c in cams {
-                let l: PTZLink = c.proto == .canonXC ? CanonLink(c, queue: self.queue) : VISCALink(c, queue: self.queue)
+                let l: PTZLink
+                switch c.proto {
+                case .canonXC: l = CanonLink(c, queue: self.queue)
+                case .middleControl: l = MiddleControlLink(c, queue: self.queue)
+                case .sonyUDP, .rawTCP: l = VISCALink(c, queue: self.queue)
+                }
                 l.onState = { [weak self] on in
                     DispatchQueue.main.async { if on { self?.online.insert(c.id) } else { self?.online.remove(c.id) } }
                 }
@@ -1117,6 +1139,18 @@ public final class PTZController: ObservableObject {
     public func recall(_ n: Int, camera: UUID? = nil) { manual(camera); with(camera) { $0.recall(n) } }
     public func store(_ n: Int) { with { $0.store(n) } }
 
+    /// Move a camera to a position over `seconds`, smoothly where the camera can time its
+    /// own move (Middle Control gimbals). Counts as a manual move, so tracking lets go.
+    public func glide(to p: PTZPosition, seconds: Double, camera: UUID) {
+        manual(camera)
+        with(camera) { $0.glide(to: p, seconds: seconds) }
+    }
+
+    /// The same, for the auto director and creative moves: tracking isn't told.
+    public func autoGlide(to p: PTZPosition, seconds: Double, camera: UUID) {
+        with(camera) { $0.glide(to: p, seconds: seconds) }
+    }
+
     /// Recall a saved shot: move to its position, or set its exposure.
     public func go(to shot: PTZShot, camera: UUID? = nil) {
         switch shot.kind {
@@ -1205,7 +1239,7 @@ public final class PTZController: ObservableObject {
     /// Whether moves will reach the camera: Canon needs this app to hold control; VISCA
     /// cameras take commands from anyone, so answering is enough.
     public func hasControl(_ c: PTZCamera) -> Bool {
-        c.proto == .canonXC ? controlled.contains(c.id) : online.contains(c.id)
+        c.proto == .canonXC || c.proto == .middleControl ? controlled.contains(c.id) : online.contains(c.id)
     }
 
     /// Whether this camera can save shots in CueVideo: it has to report where it is. Canon
