@@ -1,5 +1,5 @@
 {
-  "atemHost": "",
+  "atemHost": "10.0.1.188",
   "me": 1,
   "sources": [
     { "input": 1, "label": "Cam 1" },

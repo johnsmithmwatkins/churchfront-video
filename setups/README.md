@@ -15,7 +15,7 @@ Bethel church booth: ATEM Mini Extreme, Middle Control on the same Mac (127.0.0.
 | Cam 4 | Pocket 6K + Canon 24-105, RS4 Pro | 4 | 23.10 mm sensor, 24-105 mm |
 
 Still to fill in on site:
-- `atemHost`: the Mini Extreme's IP address.
+- `atemHost`: set to 10.0.1.188 (Mini Extreme).
 - `atemInput` and `sources`: which Mini Extreme HDMI input each camera is on (1-4 here are a guess).
 - Gimbal calibration (`countsPerDegree`, `maxDegreesPerSecond`) once the rigs are measured.
 
