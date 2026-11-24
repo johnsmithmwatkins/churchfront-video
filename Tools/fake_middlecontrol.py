@@ -3,6 +3,8 @@
 
     python3 Tools/fake_middlecontrol.py [port] [cameras]
     python3 Tools/fake_middlecontrol.py 11580 1,2,4
+    python3 Tools/fake_middlecontrol.py 11598 4 --reverse-zoom   (ZOOM+ lowers the count, like
+                                                                 the Bethel booth's Cam 4)
 
 Speaks the same TCP protocol as Middle Control (newline-terminated commands in,
 "{...}" status frames out every 200 ms): PAN_L/PAN_R/PAN_IDLE, TILT_U/TILT_D/
@@ -20,8 +22,10 @@ import sys
 import threading
 import time
 
-PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 11580
-CAMS = [int(c) for c in (sys.argv[2] if len(sys.argv) > 2 else "1,2,3").split(",")]
+REVERSE_ZOOM = "--reverse-zoom" in sys.argv
+ARGS = [a for a in sys.argv[1:] if not a.startswith("--")]
+PORT = int(ARGS[0]) if len(ARGS) > 0 else 11580
+CAMS = [int(c) for c in (ARGS[1] if len(ARGS) > 1 else "1,2,3").split(",")]
 COUNTS_PER_DEG = 2048 / 180
 MAX_DEG_S = 60.0
 ZOOM_FULL_S = 2.0
@@ -90,7 +94,7 @@ def handle(raw):
         c.glide = None
         c.tdir = {"TILT_U": 1, "TILT_D": -1, "TILT_IDLE": 0}[cmd]
     elif cmd in ("ZOOM+", "ZOOM-", "Z0"):
-        c.zdir = {"ZOOM+": 1, "ZOOM-": -1, "Z0": 0}[cmd]
+        c.zdir = {"ZOOM+": 1, "ZOOM-": -1, "Z0": 0}[cmd] * (-1 if REVERSE_ZOOM else 1)
     elif cmd.startswith("PTS"):
         c.pts = float(cmd[3:])
     elif cmd.startswith("ZS"):

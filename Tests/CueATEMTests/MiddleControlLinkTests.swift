@@ -102,6 +102,33 @@ final class MiddleControlLinkTests: XCTestCase {
         XCTAssertEqual(Double(pos?.zoom ?? 0), 2500, accuracy: 150)
     }
 
+    func testTimedMoveCorrectsABackwardsZoomMotor() throws {
+        // A second fake whose zoom motor runs the other way, as on the booth's Cam 4.
+        let script = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Tools/fake_middlecontrol.py")
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        p.arguments = ["-u", script.path, "11598", "4", "--reverse-zoom"]
+        let pipe = Pipe(); p.standardOutput = pipe; p.standardError = pipe
+        try p.run()
+        defer { p.terminate() }
+        wait(1.5)
+
+        var c = camera(4, .pocket6K24105); c.port = 11598
+        let ptz = PTZController(load: false)
+        ptz.cameras = [c]
+        wait(4) { ptz.online.contains(c.id) }
+        wait(0.5)
+        // Zoom in to a 30 degree view from wide open, over 3 seconds.
+        ptz.autoGlide(to: PTZPosition(pan: 0, tilt: 0, zoom: 3000), seconds: 3, camera: c.id)
+        wait(6)
+        var pos: PTZPosition?
+        ptz.readPosition(camera: c.id) { pos = $0 }
+        wait(1) { pos != nil }
+        XCTAssertEqual(Double(pos?.zoom ?? 0), 3000, accuracy: 200, "zoom got there despite the motor running backwards")
+    }
+
     func testJoystickCancelsATimedMove() {
         let cam2 = camera(2, .pocket6K70200)
         let ptz = PTZController(load: false)

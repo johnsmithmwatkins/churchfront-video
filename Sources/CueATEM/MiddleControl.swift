@@ -45,6 +45,9 @@ public struct GimbalSetup: Codable, Hashable {
     public var maxDegreesPerSecond: Double = 60
     /// Seconds the zoom motor takes from wide to tele at zoom speed 100.
     public var zoomFullSeconds: Double = 3
+    /// The zoom motor runs the other way round: ZOOM+ makes the reported zoom count go down.
+    /// Timed moves notice and correct this by themselves; set it to start out right.
+    public var zoomPlusLowersCount = false
     /// Lens focal length at the zoom motor's wide and tele ends (zoom 0 and 4096), in mm.
     /// Equal for a prime, or a zoom lens with no motor on the zoom ring.
     public var focalWide: Double = 24
@@ -62,7 +65,7 @@ public struct GimbalSetup: Codable, Hashable {
     public init() {}
 
     private enum Keys: String, CodingKey {
-        case countsPerDegree, maxDegreesPerSecond, zoomFullSeconds, focalWide, focalTele, sensorWidth, invertPan, invertTilt, note
+        case countsPerDegree, maxDegreesPerSecond, zoomFullSeconds, zoomPlusLowersCount, focalWide, focalTele, sensorWidth, invertPan, invertTilt, note
     }
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: Keys.self)
@@ -70,6 +73,7 @@ public struct GimbalSetup: Codable, Hashable {
         countsPerDegree = try c.decodeIfPresent(Double.self, forKey: .countsPerDegree) ?? d.countsPerDegree
         maxDegreesPerSecond = try c.decodeIfPresent(Double.self, forKey: .maxDegreesPerSecond) ?? d.maxDegreesPerSecond
         zoomFullSeconds = try c.decodeIfPresent(Double.self, forKey: .zoomFullSeconds) ?? d.zoomFullSeconds
+        zoomPlusLowersCount = try c.decodeIfPresent(Bool.self, forKey: .zoomPlusLowersCount) ?? false
         focalWide = try c.decodeIfPresent(Double.self, forKey: .focalWide) ?? d.focalWide
         focalTele = try c.decodeIfPresent(Double.self, forKey: .focalTele) ?? d.focalTele
         sensorWidth = try c.decodeIfPresent(Double.self, forKey: .sensorWidth) ?? d.sensorWidth
@@ -509,11 +513,25 @@ final class MiddleControlLink: PTZLink {
     private struct Glide {
         var target: (pan: Int, tilt: Int, zoom: Int)
         var dirs: (pan: Int, tilt: Int, zoom: Int)
-        var ends: Date
+        var startedAt: Date
+        var arriveBy: Date
+        var giveUp: Date
+        var ptPct: Double, zPct: Double
+        var wrongZoom = 0, wrongPan = 0, wrongTilt = 0, stuckZoom = 0
+        var zoomFlipped = false
         var id = UUID()
     }
     private var glideRun: Glide?
     private var glideTimer: DispatchSourceTimer?
+    /// The last two feed samples (time, pan, tilt, zoom), for measuring real speed.
+    private var samples: [(at: Date, pan: Double, tilt: Double, zoom: Double)] = []
+    /// Which way ZOOM+ moves the zoom count on this rig: +1 or -1. Starts from the setup and
+    /// corrects itself the first time a timed move sees the zoom going the wrong way.
+    private lazy var zoomSign: Int = setup.zoomPlusLowersCount ? -1 : 1
+    /// Degrees a second per percent of pan/tilt speed, and zoom counts a second per percent
+    /// of zoom speed, as measured while moving (starting from the setup's figures).
+    private lazy var ptGain: Double = setup.maxDegreesPerSecond / 100
+    private lazy var zGain: Double = GimbalSetup.zoomMax / max(0.5, setup.zoomFullSeconds) / 100
 
     func glide(to p: PTZPosition, seconds: Double) {
         cancelGlide(stop: true)
@@ -533,19 +551,21 @@ final class MiddleControlLink: PTZLink {
 
         // One speed for pan and tilt: enough for the longer of the two to arrive in time.
         let degrees = max(abs(dPan), abs(dTilt)) / setup.countsPerDegree
-        let ptPct = min(100, max(0.1, degrees / secs / max(1, setup.maxDegreesPerSecond) * 100))
-        let zPct = min(100, max(1, abs(dZoom) / GimbalSetup.zoomMax * setup.zoomFullSeconds / secs * 100))
+        let ptPct = min(100, max(0.1, degrees / secs / max(0.01, ptGain)))
+        let zPct = min(100, max(1, abs(dZoom) / secs / max(0.01, zGain)))
         if dirs.pan != 0 || dirs.tilt != 0 { hub.send(MCCommand.panTiltSpeed(ptPct, cam: cam)); lastSpeed = nil }
         if dirs.zoom != 0 { hub.send(MCCommand.zoomSpeed(zPct, cam: cam)); lastZoomSpeed = nil }
 
-        // Axes are flipped back into the gimbal's own sense (counts are already in it).
         if dirs.pan != 0 { hub.send(MCCommand.pan(dirs.pan, cam: cam)) }
         if dirs.tilt != 0 { hub.send(MCCommand.tilt(dirs.tilt, cam: cam)) }
-        if dirs.zoom != 0 { hub.send(MCCommand.zoom(dirs.zoom, cam: cam)) }
+        if dirs.zoom != 0 { hub.send(MCCommand.zoom(dirs.zoom * zoomSign, cam: cam)) }
         lastPan = 0; lastTilt = 0; lastZoom = 0
 
-        let run = Glide(target: c, dirs: dirs, ends: Date().addingTimeInterval(secs * 1.6 + 1))
+        let now = Date()
+        let run = Glide(target: c, dirs: dirs, startedAt: now, arriveBy: now.addingTimeInterval(secs),
+                        giveUp: now.addingTimeInterval(secs * 2 + 2), ptPct: ptPct, zPct: zPct)
         glideRun = run
+        samples = [(now, pan, tilt, zoomNow)]
         let t = DispatchSource.makeTimerSource(queue: queue)
         t.schedule(deadline: .now() + 0.05, repeating: 0.05)
         t.setEventHandler { [weak self] in self?.glideTick(run.id) }
@@ -556,22 +576,69 @@ final class MiddleControlLink: PTZLink {
     private func glideTick(_ id: UUID) {
         guard var g = glideRun, g.id == id else { return }
         // Give up (and stop) if the feed goes quiet or the move overruns badly.
-        guard Date() < g.ends, let f = hub.frame(cam, maxAge: 0.8), let pan = f.pan, let tilt = f.tilt else {
+        guard Date() < g.giveUp, let f = hub.frame(cam, maxAge: 0.8), let pan = f.pan, let tilt = f.tilt else {
             cancelGlide(stop: true); return
         }
-        // Stop a little before the target: the gimbal eases to a halt over a few tenths.
-        let lead = setup.countsPerDegree * 0.4
+        let zoom = f.zoom ?? 0
+        let now = Date()
+        // Measure speed only when the feed brings something new (about every 0.2 s).
+        guard let last = samples.last, pan != last.pan || tilt != last.tilt || zoom != last.zoom
+                || now.timeIntervalSince(last.at) > 0.6 else { return }
+        let dt = max(0.05, now.timeIntervalSince(last.at))
+        let vPan = (pan - last.pan) / dt, vTilt = (tilt - last.tilt) / dt, vZoom = (zoom - last.zoom) / dt
+        samples = [last, (now, pan, tilt, zoom)]
+        let left = max(0.4, g.arriveBy.timeIntervalSince(now))
+        let moving = now.timeIntervalSince(g.startedAt) > 0.5   // past the gimbal's own ease-in
+
+        // Pan and tilt: stop a little early, by about how far the gimbal coasts at this speed.
+        func coast(_ v: Double) -> Double { abs(v) * 0.35 + setup.countsPerDegree * 0.05 }
         func arrived(_ now: Double, _ target: Int, _ dir: Int, _ early: Double) -> Bool {
             dir > 0 ? now >= Double(target) - early : now <= Double(target) + early
         }
-        if g.dirs.pan != 0, arrived(pan, g.target.pan, g.dirs.pan, lead) {
-            hub.send(MCCommand.pan(0, cam: cam)); g.dirs.pan = 0
+        if g.dirs.pan != 0 {
+            if arrived(pan, g.target.pan, g.dirs.pan, coast(vPan)) { hub.send(MCCommand.pan(0, cam: cam)); g.dirs.pan = 0 }
+            else if moving, vPan * Double(g.dirs.pan) < -setup.countsPerDegree * 0.2 {
+                g.wrongPan += 1
+                if g.wrongPan >= 3 { hub.send(MCCommand.pan(0, cam: cam)); g.dirs.pan = 0 }  // safety: never fight it
+            } else { g.wrongPan = 0 }
         }
-        if g.dirs.tilt != 0, arrived(tilt, g.target.tilt, g.dirs.tilt, lead) {
-            hub.send(MCCommand.tilt(0, cam: cam)); g.dirs.tilt = 0
+        if g.dirs.tilt != 0 {
+            if arrived(tilt, g.target.tilt, g.dirs.tilt, coast(vTilt)) { hub.send(MCCommand.tilt(0, cam: cam)); g.dirs.tilt = 0 }
+            else if moving, vTilt * Double(g.dirs.tilt) < -setup.countsPerDegree * 0.2 {
+                g.wrongTilt += 1
+                if g.wrongTilt >= 3 { hub.send(MCCommand.tilt(0, cam: cam)); g.dirs.tilt = 0 }
+            } else { g.wrongTilt = 0 }
         }
-        if g.dirs.zoom != 0, arrived(f.zoom ?? 0, g.target.zoom, g.dirs.zoom, 30) {
-            hub.send(MCCommand.zoom(0, cam: cam)); g.dirs.zoom = 0
+        // Keep pan/tilt on schedule: the speed that covers what's left in the time left.
+        if g.dirs.pan != 0 || g.dirs.tilt != 0 {
+            let vMain = max(abs(g.dirs.pan != 0 ? vPan : 0), abs(g.dirs.tilt != 0 ? vTilt : 0)) / setup.countsPerDegree
+            if moving, vMain > 0.05, g.ptPct > 0 { ptGain = ptGain * 0.7 + (vMain / g.ptPct) * 0.3 }
+            let remaining = max(g.dirs.pan != 0 ? abs(Double(g.target.pan) - pan) : 0,
+                                g.dirs.tilt != 0 ? abs(Double(g.target.tilt) - tilt) : 0) / setup.countsPerDegree
+            let pct = min(100, max(0.1, remaining / left / max(0.01, ptGain)))
+            if abs(pct - g.ptPct) > max(0.2, g.ptPct * 0.15) {
+                g.ptPct = pct; hub.send(MCCommand.panTiltSpeed(pct, cam: cam))
+            }
+        }
+        // Zoom: if it runs the wrong way, this rig's motor is the other way round: flip, remember.
+        if g.dirs.zoom != 0 {
+            if arrived(zoom, g.target.zoom, g.dirs.zoom, abs(vZoom) * 0.3 + 15) {
+                hub.send(MCCommand.zoom(0, cam: cam)); g.dirs.zoom = 0
+            } else if !g.zoomFlipped, vZoom * Double(g.dirs.zoom) < -20 || (moving && abs(vZoom) < 3) {
+                // Running backwards, or not moving at all (already at the end stop it was
+                // wrongly sent toward).
+                if vZoom * Double(g.dirs.zoom) < -20 { g.wrongZoom += 1 } else { g.stuckZoom += 1 }
+                if g.wrongZoom >= 2 || g.stuckZoom >= 4 {
+                    zoomSign = -zoomSign
+                    hub.send(MCCommand.zoom(g.dirs.zoom * zoomSign, cam: cam))
+                    g.zoomFlipped = true   // once per move at most
+                }
+            } else {
+                g.wrongZoom = 0; g.stuckZoom = 0
+                if moving, abs(vZoom) > 5, g.zPct > 0 { zGain = zGain * 0.7 + (abs(vZoom) / g.zPct) * 0.3 }
+                let pct = min(100, max(1, abs(Double(g.target.zoom) - zoom) / left / max(0.01, zGain)))
+                if abs(pct - g.zPct) > max(1, g.zPct * 0.15) { g.zPct = pct; hub.send(MCCommand.zoomSpeed(pct, cam: cam)) }
+            }
         }
         glideRun = g
         if g.dirs.pan == 0 && g.dirs.tilt == 0 && g.dirs.zoom == 0 { cancelGlide(stop: false) }
