@@ -75,25 +75,52 @@ final class MiddleControlLinkTests: XCTestCase {
         XCTAssertEqual(Double(pos?.zoom ?? 0) / 100, 18.7, accuracy: 0.3)
     }
 
-    func testGlideSelectsTheCameraAndTimesTheMove() {
+    func testTimedMoveArrivesUsingContinuousCommands() {
         let cam4 = camera(4, .pocket6K24105)
         let ptz = PTZController(load: false)
         ptz.cameras = [cam4]
         wait(4) { ptz.online.contains(cam4.id) }
+        wait(0.5)
 
         let target = PTZPosition(pan: 1500, tilt: -300, zoom: 2500)  // 15 deg right, 3 down, 25 deg view
-        ptz.autoGlide(to: target, seconds: 1.0, camera: cam4.id)
-        wait(0.5)
-        XCTAssertTrue(log.contains(">> CAM4"), log)
-        XCTAssertTrue(log.contains(";1.00"), log)
-        wait(1.5)
+        ptz.autoGlide(to: target, seconds: 4, camera: cam4.id)
+        wait(1)
+        XCTAssertTrue(log.contains(">> PAN_R@C4"), log)
+        XCTAssertTrue(log.contains(">> TILT_D@C4"), log)
+        XCTAssertTrue(log.contains(">> ZOOM+@C4"), log)
+        XCTAssertFalse(log.contains("aGLOB"), "the absolute move isn't used")
+        wait(6)
+        XCTAssertTrue(log.contains(">> PAN_IDLE@C4"), log)
+        XCTAssertTrue(log.contains(">> TILT_IDLE@C4"), log)
+        XCTAssertTrue(log.contains(">> Z0@C4"), log)
 
         var pos: PTZPosition?
         ptz.readPosition(camera: cam4.id) { pos = $0 }
         wait(1) { pos != nil }
-        XCTAssertEqual(Double(pos?.pan ?? 0), 1500, accuracy: 15)
-        XCTAssertEqual(Double(pos?.tilt ?? 0), -300, accuracy: 15)
-        XCTAssertEqual(Double(pos?.zoom ?? 0), 2500, accuracy: 30)
+        XCTAssertEqual(Double(pos?.pan ?? 0), 1500, accuracy: 100)
+        XCTAssertEqual(Double(pos?.tilt ?? 0), -300, accuracy: 100)
+        XCTAssertEqual(Double(pos?.zoom ?? 0), 2500, accuracy: 150)
+    }
+
+    func testJoystickCancelsATimedMove() {
+        let cam2 = camera(2, .pocket6K70200)
+        let ptz = PTZController(load: false)
+        ptz.cameras = [cam2]
+        wait(4) { ptz.online.contains(cam2.id) }
+        wait(0.5)
+        ptz.autoGlide(to: PTZPosition(pan: 3000, tilt: 0, zoom: 1870), seconds: 8, camera: cam2.id)
+        wait(0.8)
+        ptz.drive(x: -0.5, y: 0, camera: cam2.id)
+        wait(0.5)
+        ptz.stopDrive(camera: cam2.id)
+        wait(1.5)
+        var a: PTZPosition?, b: PTZPosition?
+        ptz.readPosition(camera: cam2.id) { a = $0 }
+        wait(1) { a != nil }
+        wait(1)
+        ptz.readPosition(camera: cam2.id) { b = $0 }
+        wait(1) { b != nil }
+        XCTAssertEqual(a?.pan, b?.pan, "the timed move doesn't carry on after the joystick takes over")
     }
 
     func testRemovingTheCameraStopsIt() {

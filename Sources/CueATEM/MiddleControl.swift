@@ -16,8 +16,10 @@ import Network
 //   PTS<0-100> / ZS<0-100>         pan/tilt speed and zoom speed (tenths below 10% on 4.1+)
 //   aGLOB;aP<p>;aT<t>;aR<r>;aZ<z>;<seconds>
 //                                  move the SELECTED camera to an absolute position over
-//                                  that many seconds. Pan, tilt, roll -2048..2048, zoom
-//                                  0..4096. An empty field leaves that axis alone.
+//                                  that many seconds (pan, tilt, roll -2048..2048, zoom
+//                                  0..4096). Ignored by the Bethel booth's Middle Control in
+//                                  testing, so timed moves are built from the continuous
+//                                  commands instead (see "Timed moves" below).
 //   PRESET<n>C<cam> / SPRESET<n>C<cam>   recall / save a Middle Control preset
 //   AUTOFOCUS, FOCUS_IN / FOCUS_OUT / FOCUS_IDLE, RECENTER, GIMBALWAKE, GIMBALSLEEP
 //   FEED_ALL1                      (4.1+) send a status frame for every camera, not only
@@ -41,6 +43,8 @@ public struct GimbalSetup: Codable, Hashable {
     /// Degrees a second the gimbal turns at pan/tilt speed 100. Auto tracking also learns
     /// the real figure as it runs, so this only needs to be in the right range.
     public var maxDegreesPerSecond: Double = 60
+    /// Seconds the zoom motor takes from wide to tele at zoom speed 100.
+    public var zoomFullSeconds: Double = 3
     /// Lens focal length at the zoom motor's wide and tele ends (zoom 0 and 4096), in mm.
     /// Equal for a prime, or a zoom lens with no motor on the zoom ring.
     public var focalWide: Double = 24
@@ -58,13 +62,14 @@ public struct GimbalSetup: Codable, Hashable {
     public init() {}
 
     private enum Keys: String, CodingKey {
-        case countsPerDegree, maxDegreesPerSecond, focalWide, focalTele, sensorWidth, invertPan, invertTilt, note
+        case countsPerDegree, maxDegreesPerSecond, zoomFullSeconds, focalWide, focalTele, sensorWidth, invertPan, invertTilt, note
     }
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: Keys.self)
         let d = GimbalSetup.make()
         countsPerDegree = try c.decodeIfPresent(Double.self, forKey: .countsPerDegree) ?? d.countsPerDegree
         maxDegreesPerSecond = try c.decodeIfPresent(Double.self, forKey: .maxDegreesPerSecond) ?? d.maxDegreesPerSecond
+        zoomFullSeconds = try c.decodeIfPresent(Double.self, forKey: .zoomFullSeconds) ?? d.zoomFullSeconds
         focalWide = try c.decodeIfPresent(Double.self, forKey: .focalWide) ?? d.focalWide
         focalTele = try c.decodeIfPresent(Double.self, forKey: .focalTele) ?? d.focalTele
         sensorWidth = try c.decodeIfPresent(Double.self, forKey: .sensorWidth) ?? d.sensorWidth
@@ -412,6 +417,7 @@ final class MiddleControlLink: PTZLink {
 
     func stop() {
         // Never leave the gimbal moving when this link goes away.
+        cancelGlide(stop: false)
         if online { stopMotion() }
         hub.detach(token)
         online = false
@@ -431,6 +437,7 @@ final class MiddleControlLink: PTZLink {
     /// one's speed; an axis asked for much less than that is held still this tick (auto
     /// tracking corrects it on the next one), so a small tilt fix doesn't swing the camera.
     private func move(panDir: Int, tiltDir: Int, panPct: Double, tiltPct: Double) {
+        cancelGlide(stop: true)
         var pd = panDir, td = tiltDir
         let top = max(panDir == 0 ? 0 : panPct, tiltDir == 0 ? 0 : tiltPct)
         if pd != 0, td != 0 {
@@ -468,6 +475,7 @@ final class MiddleControlLink: PTZLink {
     }
 
     func zoom(_ v: Double) {
+        cancelGlide(stop: true)
         let dir = v == 0 ? 0 : (v > 0 ? 1 : -1)
         if dir != 0 {
             let s = MCCommand.zoomSpeed(min(100, 3 + abs(v) * 60), cam: cam)
@@ -488,13 +496,96 @@ final class MiddleControlLink: PTZLink {
         done(setup.position(pan: p, tilt: t, zoom: f.zoom ?? 0))
     }
 
-    func goTo(_ p: PTZPosition) { glide(to: p, seconds: 1.0) }
+    func goTo(_ p: PTZPosition) { glide(to: p, seconds: 1.5) }
+
+    // MARK: Timed moves
+    //
+    // Middle Control's absolute move (aGLOB) was ignored on the Bethel booth's Middle Control
+    // in testing (November 2026), so timed moves are made from the commands that work: set a
+    // slow speed, start pan, tilt and zoom toward the target, watch the position the feed
+    // reports, and stop each axis as it arrives (a little early, since the gimbal eases to a
+    // stop). Anything else sent to the camera (joystick, tracking, a stop) cancels the move.
+
+    private struct Glide {
+        var target: (pan: Int, tilt: Int, zoom: Int)
+        var dirs: (pan: Int, tilt: Int, zoom: Int)
+        var ends: Date
+        var id = UUID()
+    }
+    private var glideRun: Glide?
+    private var glideTimer: DispatchSourceTimer?
 
     func glide(to p: PTZPosition, seconds: Double) {
+        cancelGlide(stop: true)
+        guard let f = hub.frame(cam), let pan = f.pan, let tilt = f.tilt else { return }
         let c = setup.counts(p)
         let hasZoom = setup.focalTele > setup.focalWide * 1.01
-        lastPan = 0; lastTilt = 0
-        hub.sendToSelected(cam, MCCommand.glide(pan: c.pan, tilt: c.tilt, zoom: hasZoom ? c.zoom : nil, seconds: seconds))
+        let zoomNow = f.zoom ?? 0
+        let secs = max(0.5, seconds)
+
+        let dPan = Double(c.pan) - pan, dTilt = Double(c.tilt) - tilt
+        let dZoom = hasZoom ? Double(c.zoom) - zoomNow : 0
+        let tol = setup.countsPerDegree * 0.3, zoomTol = 40.0
+        let dirs = (pan: abs(dPan) > tol ? (dPan > 0 ? 1 : -1) : 0,
+                    tilt: abs(dTilt) > tol ? (dTilt > 0 ? 1 : -1) : 0,
+                    zoom: abs(dZoom) > zoomTol ? (dZoom > 0 ? 1 : -1) : 0)
+        guard dirs.pan != 0 || dirs.tilt != 0 || dirs.zoom != 0 else { return }
+
+        // One speed for pan and tilt: enough for the longer of the two to arrive in time.
+        let degrees = max(abs(dPan), abs(dTilt)) / setup.countsPerDegree
+        let ptPct = min(100, max(0.1, degrees / secs / max(1, setup.maxDegreesPerSecond) * 100))
+        let zPct = min(100, max(1, abs(dZoom) / GimbalSetup.zoomMax * setup.zoomFullSeconds / secs * 100))
+        if dirs.pan != 0 || dirs.tilt != 0 { hub.send(MCCommand.panTiltSpeed(ptPct, cam: cam)); lastSpeed = nil }
+        if dirs.zoom != 0 { hub.send(MCCommand.zoomSpeed(zPct, cam: cam)); lastZoomSpeed = nil }
+
+        // Axes are flipped back into the gimbal's own sense (counts are already in it).
+        if dirs.pan != 0 { hub.send(MCCommand.pan(dirs.pan, cam: cam)) }
+        if dirs.tilt != 0 { hub.send(MCCommand.tilt(dirs.tilt, cam: cam)) }
+        if dirs.zoom != 0 { hub.send(MCCommand.zoom(dirs.zoom, cam: cam)) }
+        lastPan = 0; lastTilt = 0; lastZoom = 0
+
+        let run = Glide(target: c, dirs: dirs, ends: Date().addingTimeInterval(secs * 1.6 + 1))
+        glideRun = run
+        let t = DispatchSource.makeTimerSource(queue: queue)
+        t.schedule(deadline: .now() + 0.05, repeating: 0.05)
+        t.setEventHandler { [weak self] in self?.glideTick(run.id) }
+        t.resume()
+        glideTimer = t
+    }
+
+    private func glideTick(_ id: UUID) {
+        guard var g = glideRun, g.id == id else { return }
+        // Give up (and stop) if the feed goes quiet or the move overruns badly.
+        guard Date() < g.ends, let f = hub.frame(cam, maxAge: 0.8), let pan = f.pan, let tilt = f.tilt else {
+            cancelGlide(stop: true); return
+        }
+        // Stop a little before the target: the gimbal eases to a halt over a few tenths.
+        let lead = setup.countsPerDegree * 0.4
+        func arrived(_ now: Double, _ target: Int, _ dir: Int, _ early: Double) -> Bool {
+            dir > 0 ? now >= Double(target) - early : now <= Double(target) + early
+        }
+        if g.dirs.pan != 0, arrived(pan, g.target.pan, g.dirs.pan, lead) {
+            hub.send(MCCommand.pan(0, cam: cam)); g.dirs.pan = 0
+        }
+        if g.dirs.tilt != 0, arrived(tilt, g.target.tilt, g.dirs.tilt, lead) {
+            hub.send(MCCommand.tilt(0, cam: cam)); g.dirs.tilt = 0
+        }
+        if g.dirs.zoom != 0, arrived(f.zoom ?? 0, g.target.zoom, g.dirs.zoom, 30) {
+            hub.send(MCCommand.zoom(0, cam: cam)); g.dirs.zoom = 0
+        }
+        glideRun = g
+        if g.dirs.pan == 0 && g.dirs.tilt == 0 && g.dirs.zoom == 0 { cancelGlide(stop: false) }
+    }
+
+    /// Ends a timed move; with `stop`, also halts every axis it was moving.
+    private func cancelGlide(stop: Bool) {
+        glideTimer?.cancel(); glideTimer = nil
+        if stop, let g = glideRun {
+            if g.dirs.pan != 0 { hub.send(MCCommand.pan(0, cam: cam)) }
+            if g.dirs.tilt != 0 { hub.send(MCCommand.tilt(0, cam: cam)) }
+            if g.dirs.zoom != 0 { hub.send(MCCommand.zoom(0, cam: cam)) }
+        }
+        glideRun = nil
     }
 
     func deletePreset(_ n: Int, _ done: @escaping (String?) -> Void) {
