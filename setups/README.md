@@ -20,3 +20,7 @@ Still to fill in on site:
 - Gimbal calibration (`countsPerDegree`, `maxDegreesPerSecond`) once the rigs are measured.
 
 In Middle Control, turn ATEM Link off.
+
+Capture: Elgato Cam Link on the Mac, fed by a Mini Extreme HDMI output set to
+Multiview. It shows up on macOS as a camera (no driver needed); CueVideo cuts the
+multiview into one picture per camera for tracking.
