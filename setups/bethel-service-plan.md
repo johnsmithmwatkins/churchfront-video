@@ -38,10 +38,10 @@ song builds. Medium until sure.
 
 - Cams 1, 2, 4: RS4 Pro gimbals on Middle Control, fully automatic.
 - Cam 3: Studio 4K + Xeen on a tripod, not motorised. Framed and focused before service on
-  where the deacon prays (and, if that is the pulpit, it doubles as the steady sermon shot).
+  the pulpit, where the deacon always prays. The same shot serves the prayer, the scripture
+  reading and the steady sermon shot.
 
 ## Open questions
 
-- Does the deacon pray from the pulpit?
 - Clips of a slow song, a fast song, the special and a few minutes of preaching, to measure
   shot lengths, fade lengths and framing.
